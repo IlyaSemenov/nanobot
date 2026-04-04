@@ -483,7 +483,7 @@ async def test_send_reply_infers_topic_from_message_id_cache() -> None:
     config = TelegramConfig(enabled=True, token="123:abc", allow_from=["*"], reply_to_message=True)
     channel = TelegramChannel(config, MessageBus())
     channel._app = _FakeApp(lambda: None)
-    channel._message_threads[("123", 10)] = 42
+    channel._message_threads[("123", 10)] = {"message_thread_id": 42}
 
     await channel.send(
         OutboundMessage(
@@ -495,6 +495,26 @@ async def test_send_reply_infers_topic_from_message_id_cache() -> None:
     )
 
     assert channel._app.bot.sent_messages[0]["message_thread_id"] == 42
+    assert channel._app.bot.sent_messages[0]["reply_parameters"].message_id == 10
+
+
+@pytest.mark.asyncio
+async def test_send_reply_infers_direct_message_topic_from_message_id_cache() -> None:
+    config = TelegramConfig(enabled=True, token="123:abc", allow_from=["*"], reply_to_message=True)
+    channel = TelegramChannel(config, MessageBus())
+    channel._app = _FakeApp(lambda: None)
+    channel._message_threads[("123", 10)] = {"direct_messages_topic_id": 77}
+
+    await channel.send(
+        OutboundMessage(
+            channel="telegram",
+            chat_id="123",
+            content="hello",
+            metadata={"message_id": 10},
+        )
+    )
+
+    assert channel._app.bot.sent_messages[0]["direct_messages_topic_id"] == 77
     assert channel._app.bot.sent_messages[0]["reply_parameters"].message_id == 10
 
 

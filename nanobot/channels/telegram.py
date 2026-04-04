@@ -221,7 +221,7 @@ class TelegramChannel(BaseChannel):
         self._typing_tasks: dict[str, asyncio.Task] = {}  # chat_id -> typing loop task
         self._media_group_buffers: dict[str, dict] = {}
         self._media_group_tasks: dict[str, asyncio.Task] = {}
-        self._message_threads: dict[tuple[str, int], int] = {}
+        self._message_threads: dict[tuple[str, int], dict[str, int]] = {}
         self._bot_user_id: int | None = None
         self._bot_username: str | None = None
         self._stream_bufs: dict[str, _StreamBuf] = {}  # chat_id -> streaming state
@@ -401,12 +401,17 @@ class TelegramChannel(BaseChannel):
             logger.error("Invalid chat_id: {}", msg.chat_id)
             return
         reply_to_message_id = msg.metadata.get("message_id")
+        direct_messages_topic_id = msg.metadata.get("direct_messages_topic_id")
         message_thread_id = msg.metadata.get("message_thread_id")
-        if message_thread_id is None and reply_to_message_id is not None:
-            message_thread_id = self._message_threads.get((msg.chat_id, reply_to_message_id))
         thread_kwargs = {}
-        if message_thread_id is not None:
+        if direct_messages_topic_id is not None:
+            thread_kwargs["direct_messages_topic_id"] = direct_messages_topic_id
+        elif message_thread_id is not None:
             thread_kwargs["message_thread_id"] = message_thread_id
+        elif reply_to_message_id is not None:
+            cached_thread = self._message_threads.get((msg.chat_id, reply_to_message_id))
+            if cached_thread is not None:
+                thread_kwargs = cached_thread
 
         reply_params = None
         if self.config.reply_to_message:
@@ -584,11 +589,17 @@ class TelegramChannel(BaseChannel):
             return
 
         now = time.monotonic()
+        thread_kwargs = {}
+        if direct_topic_id := meta.get("direct_messages_topic_id"):
+            thread_kwargs["direct_messages_topic_id"] = direct_topic_id
+        elif message_thread_id := meta.get("message_thread_id"):
+            thread_kwargs["message_thread_id"] = message_thread_id
         if buf.message_id is None:
             try:
                 sent = await self._call_with_retry(
                     self._app.bot.send_message,
                     chat_id=int_chat_id, text=buf.text,
+                    **thread_kwargs,
                 )
                 buf.message_id = sent.message_id
                 buf.last_edit = now
@@ -636,11 +647,14 @@ class TelegramChannel(BaseChannel):
 
     @staticmethod
     def _derive_topic_session_key(message) -> str | None:
-        """Derive topic-scoped session key for non-private Telegram chats."""
-        message_thread_id = getattr(message, "message_thread_id", None)
-        if message.chat.type == "private" or message_thread_id is None:
+        """Derive topic-scoped session key for Telegram chats with threads."""
+        # Threaded DMs use direct_messages_topic_id, forum supergroups use message_thread_id
+        thread_id = getattr(message, "direct_messages_topic_id", None)
+        if thread_id is None:
+            thread_id = getattr(message, "message_thread_id", None)
+        if thread_id is None:
             return None
-        return f"telegram:{message.chat_id}:topic:{message_thread_id}"
+        return f"telegram:{message.chat_id}:topic:{thread_id}"
 
     @staticmethod
     def _build_message_metadata(message, user) -> dict:
@@ -653,6 +667,7 @@ class TelegramChannel(BaseChannel):
             "first_name": user.first_name,
             "is_group": message.chat.type != "private",
             "message_thread_id": getattr(message, "message_thread_id", None),
+            "direct_messages_topic_id": getattr(message, "direct_messages_topic_id", None),
             "is_forum": bool(getattr(message.chat, "is_forum", False)),
             "reply_to_message_id": getattr(reply_to, "message_id", None) if reply_to else None,
         }
@@ -800,12 +815,17 @@ class TelegramChannel(BaseChannel):
         return bool(bot_id and reply_user and reply_user.id == bot_id)
 
     def _remember_thread_context(self, message) -> None:
-        """Cache topic thread id by chat/message id for follow-up replies."""
+        """Cache Telegram thread context by chat/message id for follow-up replies."""
+        direct_messages_topic_id = getattr(message, "direct_messages_topic_id", None)
         message_thread_id = getattr(message, "message_thread_id", None)
-        if message_thread_id is None:
+        if direct_messages_topic_id is not None:
+            thread = {"direct_messages_topic_id": direct_messages_topic_id}
+        elif message_thread_id is not None:
+            thread = {"message_thread_id": message_thread_id}
+        else:
             return
         key = (str(message.chat_id), message.message_id)
-        self._message_threads[key] = message_thread_id
+        self._message_threads[key] = thread
         if len(self._message_threads) > 1000:
             self._message_threads.pop(next(iter(self._message_threads)))
 
